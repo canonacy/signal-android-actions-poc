@@ -1,0 +1,26 @@
+# Never commit run output, Android state, credentials, or downloaded apps.
+artifacts/*
+!artifacts/.gitkeep
+*.apk
+*.aab
+.avd/
+.android/
+.dev.vars
+.env
+.env.*
+*.pem
+*.json
+credentials*
+token*
+__pycache__/
+.active-manual-stream-run-id
+
+# Local deployment/run bookkeeping; public identifiers but not source.
+.github-repository
+.cloudflare-worker-name
+.cloudflare-worker-url
+.last-successful-poc-run-id
+.last-worker-deploy-run-id
+
+.cloudflare-kv-namespace-id
+.last-*

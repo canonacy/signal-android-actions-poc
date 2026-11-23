@@ -1,0 +1,259 @@
+name: Android Signal emulator session
+
+# This workflow is manual-only.  The optional restore mode uses credentials
+# supplied exclusively as Actions secrets and never logs or persists them.
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: 'How long to hold the booted emulator open (5–270 minutes)'
+        required: true
+        default: '8'
+        type: string
+      install_signal:
+        description: 'Download, certificate-verify, install, and launch the official Signal APK (no sign-in)'
+        required: true
+        default: true
+        type: boolean
+      enable_stream:
+        description: 'Start password-protected noVNC through the fixed Worker and a temporary Quick Tunnel'
+        required: true
+        default: false
+        type: boolean
+      sensitive_session:
+        description: 'Disable screenshots and diagnostic artifact upload for real account setup'
+        required: true
+        default: false
+        type: boolean
+      automate_secure_backup_restore:
+        description: 'Use the configured private secrets to automate Signal Secure Backup restore and a final backup attempt'
+        required: true
+        default: false
+        type: boolean
+      enable_qr_camera:
+        description: 'Enable an emulator camera source for the Signal CLI pairing QR'
+        required: true
+        default: false
+        type: boolean
+      qr_camera_source:
+        description: 'QR camera path: direct-image is a full camera frame; virtualscene is the legacy 3D wall'
+        required: true
+        default: 'direct-image'
+        type: choice
+        options:
+          - direct-image
+          - virtualscene
+
+      deploy_worker:
+        description: 'Deploy the encrypted Worker source only; do not start Android'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Do not permit two emulator jobs to use the same Tunnel hostname at once.
+concurrency:
+  group: signal-android-emulator-poc
+  cancel-in-progress: false
+
+jobs:
+  deploy-private-worker:
+    if: ${{ inputs.deploy_worker == true }}
+    name: Deploy encrypted stream-control Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out encrypted source bundle
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
+
+      - name: Authenticate and decrypt private source
+        env:
+          REPOSITORY_CODE_DECRYPTION_KEY: ${{ secrets.REPOSITORY_CODE_DECRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          : "${REPOSITORY_CODE_DECRYPTION_KEY:?repository decryption secret is unavailable}"
+          expected="$(cat encrypted-source.tar.gz.enc.hmac)"
+          actual="$(openssl dgst -sha256 -mac HMAC -macopt "key:${REPOSITORY_CODE_DECRYPTION_KEY}" -binary encrypted-source.tar.gz.enc | base64 -w0)"
+          test "$actual" = "$expected"
+          archive="${RUNNER_TEMP:-/tmp}/encrypted-source.tar.gz"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha512 \
+            -in encrypted-source.tar.gz.enc -out "$archive" -pass env:REPOSITORY_CODE_DECRYPTION_KEY
+          tar -xzf "$archive" -C "$GITHUB_WORKSPACE"
+          rm -f "$archive"
+
+      - name: Run Worker unit tests without credentials
+        run: node --test worker/src/index.test.js
+      - name: Deploy Worker from GitHub Secrets
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config worker/wrangler.jsonc
+
+  emulator-poc:
+    if: ${{ inputs.deploy_worker != true }}
+    name: Boot minimal Android + optional Signal launch
+    runs-on: ubuntu-latest
+    timeout-minutes: 315
+    env:
+      DISPLAY: :99
+      POC_RUN_MINUTES: ${{ inputs.run_minutes }}
+      INSTALL_SIGNAL: ${{ inputs.install_signal }}
+      ENABLE_STREAM: ${{ inputs.enable_stream }}
+      SENSITIVE_SESSION: ${{ inputs.sensitive_session }}
+      AUTOMATE_SECURE_BACKUP_RESTORE: ${{ inputs.automate_secure_backup_restore }}
+      ENABLE_QR_CAMERA: ${{ inputs.enable_qr_camera }}
+      QR_CAMERA_SOURCE: ${{ inputs.qr_camera_source }}
+      DIRECT_CAMERA_FRAME: /tmp/signal-cli-camera.png
+    steps:
+      - name: Check out encrypted source bundle
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
+
+      - name: Authenticate and decrypt private source
+        env:
+          REPOSITORY_CODE_DECRYPTION_KEY: ${{ secrets.REPOSITORY_CODE_DECRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          : "${REPOSITORY_CODE_DECRYPTION_KEY:?repository decryption secret is unavailable}"
+          expected="$(cat encrypted-source.tar.gz.enc.hmac)"
+          actual="$(openssl dgst -sha256 -mac HMAC -macopt "key:${REPOSITORY_CODE_DECRYPTION_KEY}" -binary encrypted-source.tar.gz.enc | base64 -w0)"
+          test "$actual" = "$expected"
+          archive="${RUNNER_TEMP:-/tmp}/encrypted-source.tar.gz"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha512 \
+            -in encrypted-source.tar.gz.enc -out "$archive" -pass env:REPOSITORY_CODE_DECRYPTION_KEY
+          tar -xzf "$archive" -C "$GITHUB_WORKSPACE"
+          rm -f "$archive"
+
+      - name: Validate bounded manual inputs
+        run: bash scripts/validate-inputs.sh
+
+      - name: Record runner capacity before spending time on Android
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo '=== UTC time ==='; date -u +%FT%TZ
+            echo '=== OS ==='; cat /etc/os-release
+            echo '=== CPU ==='; lscpu
+            echo '=== RAM ==='; free -h
+            echo '=== Disk ==='; df -h
+            echo '=== /dev/kvm before permission change ==='; ls -l /dev/kvm || true
+          } > artifacts/runner-before.txt
+
+      - name: Enable KVM access or stop with evidence
+        run: |
+          set -euo pipefail
+          if [[ ! -e /dev/kvm ]]; then
+            echo '::error::No /dev/kvm on this GitHub-hosted runner. Do not continue with a software-rendered Android design.'
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm | tee artifacts/kvm-after-permissions.txt
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Add a bounded host swap safety cushion
+        run: |
+          set -euo pipefail
+          # This is a host-level fallback against an OOM kill, not extra fast
+          # Android RAM. It is used only under memory pressure and is capped at
+          # 2 GiB so the emulator image still has ample ephemeral disk space.
+          if [[ -n "$(swapon --show --noheadings)" ]]; then
+            echo 'Host swap already exists; no extra swap file is needed.'
+          elif sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile; then
+            echo 'Enabled a 2 GiB bounded host swap safety cushion.'
+          else
+            sudo swapoff /swapfile 2>/dev/null || true
+            sudo rm -f /swapfile
+            echo '::warning::Could not enable extra host swap; continuing with physical RAM only.'
+          fi
+          free -h
+          swapon --show || true
+
+      - name: Install only the local display and noVNC dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # Recent Android Emulator/QEMU builds dynamically link libpulse even when
+          # launched with -noaudio; without this runtime library QEMU exits before ADB.
+          sudo apt-get install -y -qq libpulse0 xvfb openbox x11vnc novnc websockify qrencode zbar-tools imagemagick xdotool
+          bash scripts/prepare-display.sh
+
+      - name: Prepare a harmless direct-camera QR before Android boots
+        if: ${{ inputs.enable_qr_camera && inputs.qr_camera_source == 'direct-image' }}
+        run: bash scripts/prepare-direct-camera-test.sh
+
+      - name: Install Cloudflare Tunnel client only if remote viewing was requested
+        if: ${{ inputs.enable_stream }}
+        run: bash scripts/install-cloudflared.sh
+
+      - name: Install current signal-cli for the temporary authenticated helper
+        if: ${{ inputs.enable_stream }}
+        run: bash scripts/install-signal-cli.sh
+
+      - name: Install local Emulator gRPC client for the legacy virtual-scene camera
+        if: ${{ inputs.enable_qr_camera && inputs.qr_camera_source == 'virtualscene' }}
+        run: bash scripts/install-grpcurl.sh
+
+      - name: Create, boot, inspect, and destroy the lightweight AVD
+        uses: ReactiveCircus/android-emulator-runner@c9c93e6ba9c4194322e114c40970d5983d9a07cc # v2.38.0
+        env:
+          # These two secrets are intentionally absent for a normal POC run.
+          # They are passed only to the child processes; shell commands never echo them.
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          STREAM_CONTROL_TOKEN: ${{ secrets.STREAM_CONTROL_TOKEN }}
+          STREAM_CONTROL_URL: ${{ vars.STREAM_CONTROL_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_NOTIFY_CHAT_ID: ${{ vars.TELEGRAM_NOTIFY_CHAT_ID }}
+          AGENT_DIAGNOSTIC_TOKEN: ${{ secrets.AGENT_DIAGNOSTIC_TOKEN }}
+          # Present only to the restore automation process. The session script
+          # removes them before starting stream/diagnostic helper children.
+          SIGNAL_REGION_NAME: ${{ secrets.REGION_NAME }}
+          SIGNAL_PHONE_NUMBER: ${{ secrets.NUMBER }}
+          SIGNAL_BACKUP_RECOVERY_KEY: ${{ secrets.RECOVERY_KEY }}
+        with:
+          # API 30 is old enough to reduce the image/boot cost but modern enough
+          # for the current Signal Android baseline. No Play Store image or Google
+          # account is included in this first test.
+          api-level: 30
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          # Backup creation encrypts and hashes data locally; the original
+          # 2-core/1.5-GiB allocation was too constrained for that workload.
+          cores: 4
+          ram-size: 3072M
+          heap-size: 512M
+          disk-size: 6144M
+          emulator-boot-timeout: 600
+          disable-animations: true
+          disable-linux-hw-accel: false
+          # Deliberately omit -no-window: Xvfb owns this window for optional noVNC.
+          # direct-image is a full-frame Camera HAL source, not a QR on a 3D
+          # wall. Its harmless initial PNG exists before boot and is verified
+          # through Android's actual camera preview before any pairing run.
+          emulator-options: -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back ${{ inputs.enable_qr_camera && inputs.qr_camera_source == 'direct-image' && 'imagefile:/tmp/signal-cli-camera.png' || inputs.enable_qr_camera && 'virtualscene -grpc 8556' || 'none' }} -camera-front none
+          script: bash scripts/emulator-session.sh
+
+      - name: Record runner capacity after Android
+        if: ${{ always() }}
+        run: |
+          {
+            echo '=== UTC time ==='; date -u +%FT%TZ
+            echo '=== RAM ==='; free -h
+            echo '=== Disk ==='; df -h
+            echo '=== Processes ==='; ps auxww --sort=-%mem | head -n 40
+          } > artifacts/runner-after.txt
+
+      - name: Upload non-sensitive diagnostic evidence for three days
+        if: ${{ always() && inputs.sensitive_session != true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-emulator-poc-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 3
